@@ -10,7 +10,9 @@ import requests
 class PubgApiError(RuntimeError):
     pass
 
-
+# Initialize the PUBG API client, validate the API key,
+# save the selected platform shard, and prepare a reusable
+# authenticated HTTP session.
 class PubgApiClient:
     BASE_URL = "https://api.pubg.com"
 
@@ -38,6 +40,10 @@ class PubgApiClient:
                 "User-Agent": "pubg-streaming-platform/1.0",
             }
         )
+#---------------------------------------------------
+# Send a GET request, handle network and HTTP errors,
+# and convert the successful JSON response into Python data.
+# Authentication can be disabled for public telemetry URLs.
 
     def _get_json(
         self,
@@ -93,7 +99,9 @@ class PubgApiClient:
             ) from exc
 
         return response.json()
-
+#---------------------------------------------------
+# Request a sample of recent PUBG matches,
+# randomly select one match, and return its match ID.
     def get_random_match_id(self) -> str:
         url = (
             f"{self.BASE_URL}/shards/"
@@ -117,7 +125,9 @@ class PubgApiClient:
         selected_match = random.choice(matches)
 
         return selected_match["id"]
-
+#---------------------------------------------------
+# Request and return the full data for one PUBG match
+# using its match ID.
     def get_match(
         self,
         match_id: str,
@@ -134,7 +144,9 @@ class PubgApiClient:
         )
 
         return self._get_json(url)
-
+#---------------------------------------------------
+# Extract participant records from the match response
+# and return a simplified list of player statistics.
     @staticmethod
     def get_match_players(
         match_payload: dict[str, Any],
@@ -167,7 +179,9 @@ class PubgApiClient:
             )
 
         return players
-
+#---------------------------------------------------
+# Find the telemetry asset referenced by the match
+# and return the URL of its detailed event data file.
     @staticmethod
     def get_telemetry_url(
         match_payload: dict[str, Any],
@@ -204,7 +218,9 @@ class PubgApiClient:
             "Telemetry asset was referenced, "
             "but its URL was not found."
         )
-
+#---------------------------------------------------
+# Download the match telemetry file and return
+# its detailed events as a list of dictionaries.
     def get_telemetry(
         self,
         telemetry_url: str,
