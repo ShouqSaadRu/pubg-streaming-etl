@@ -7,4 +7,4 @@ __pycache__/
 .vscode/
 .idea/
 checkpoints/combat-stream
-
+data/eda/
