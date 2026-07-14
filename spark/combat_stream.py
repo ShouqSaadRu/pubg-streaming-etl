@@ -15,21 +15,31 @@ from pyspark.sql.types import (
     StructType,
 )
 
+
 load_dotenv()
+
+
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv(
     "KAFKA_BOOTSTRAP_SERVERS",
     "localhost:9092",
 )
+
 KAFKA_COMBAT_TOPIC = os.getenv(
     "KAFKA_COMBAT_TOPIC",
     "pubg.combat-events",
 )
+
+# Define where Spark stores streaming progress and state
+# so the pipeline can resume after it is restarted.
 CHECKPOINT_LOCATION = os.getenv(
     "SPARK_COMBAT_CHECKPOINT",
     "checkpoints/combat-stream",
 )
 
+
+# Define the expected structure and data types
+# of the combat-event JSON messages received from Kafka.
 COMBAT_EVENT_SCHEMA = StructType(
     [
         StructField("event_id", StringType(), False),
@@ -48,11 +58,17 @@ COMBAT_EVENT_SCHEMA = StructType(
         StructField("distance_raw", DoubleType(), True),
         StructField("is_headshot", BooleanType(), True),
         StructField("is_suicide", BooleanType(), True),
-        StructField("assist_account_ids", ArrayType(StringType()), True),
+        StructField(
+            "assist_account_ids",
+            ArrayType(StringType()),
+            True,
+        ),
     ]
 )
 
 
+# Create and configure the Spark application that will
+# process PUBG combat events as a streaming pipeline.
 def create_spark_session() -> SparkSession:
     return (
         SparkSession.builder
@@ -63,11 +79,18 @@ def create_spark_session() -> SparkSession:
     )
 
 
-def read_raw_combat_stream(spark: SparkSession) -> DataFrame:
+# Connect Spark Structured Streaming to Kafka and create
+# a streaming DataFrame containing raw Kafka records.
+def read_raw_combat_stream(
+    spark: SparkSession,
+) -> DataFrame:
     return (
         spark.readStream
         .format("kafka")
-        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
+        .option(
+            "kafka.bootstrap.servers",
+            KAFKA_BOOTSTRAP_SERVERS,
+        )
         .option("subscribe", KAFKA_COMBAT_TOPIC)
         .option("startingOffsets", "earliest")
         .option("failOnDataLoss", "false")
@@ -75,6 +98,9 @@ def read_raw_combat_stream(spark: SparkSession) -> DataFrame:
     )
 
 
+# Convert Kafka key and value bytes into strings,
+# parse each JSON value using the combat-event schema,
+# and preserve Kafka metadata for tracing and debugging.
 def parse_events(kafka_stream: DataFrame) -> DataFrame:
     return (
         kafka_stream
@@ -88,7 +114,14 @@ def parse_events(kafka_stream: DataFrame) -> DataFrame:
         )
         .withColumn(
             "event",
-            F.from_json(F.col("raw_json"), COMBAT_EVENT_SCHEMA),
+            F.from_json(
+                F.col("raw_json"),
+                COMBAT_EVENT_SCHEMA,
+            ),
+        )
+        .withColumn(
+            "json_parsed_successfully",
+            F.col("event").isNotNull(),
         )
         .select(
             "kafka_key",
@@ -97,51 +130,107 @@ def parse_events(kafka_stream: DataFrame) -> DataFrame:
             "kafka_partition",
             "kafka_offset",
             "kafka_timestamp",
+            "json_parsed_successfully",
             "event.*",
         )
     )
 
-
-def transform_events(parsed: DataFrame) -> DataFrame:
+# Clean, validate, enrich, and deduplicate parsed combat events
+# before selecting the final columns used by downstream systems.
+def transform_events(
+    parsed: DataFrame,
+) -> DataFrame:
 
     raw_distance = F.col("distance_raw")
 
+    # Remove technical PUBG prefixes and suffixes
+    # from the raw weapon class name.
     cleaned_weapon = F.regexp_replace(
-        F.regexp_replace(F.col("weapon_raw"), r"^Weap", ""),
+        F.regexp_replace(
+            F.col("weapon_raw"),
+            r"^Weap",
+            "",
+        ),
         r"_C$",
         "",
     )
 
     return (
         parsed
+
         .filter(F.col("event_id").isNotNull())
         .filter(F.col("match_id").isNotNull())
-        .withColumn("event_timestamp", F.to_timestamp("event_time"))
+
+        .withColumn(
+            "event_timestamp",
+            F.to_timestamp("event_time"),
+        )
+
+        # Identify deaths caused by the game environment
+        # instead of another player.
         .withColumn(
             "is_environmental_death",
-            F.col("killer").isNull() | (F.col("killer") == "Environment"),
+            F.col("killer").isNull()
+            | (F.col("killer") == "Environment"),
         )
+
+        # Replace unknown weapons with null and clean
+        # valid weapon class names.
         .withColumn(
             "weapon_clean",
             F.when(
-                F.col("weapon_raw").isNull() | (F.col("weapon_raw") == "Unknown"),
+                F.col("weapon_raw").isNull()
+                | (
+                    F.col("weapon_raw")
+                    == "Unknown"
+                ),
                 F.lit(None).cast("string"),
             ).otherwise(cleaned_weapon),
         )
+
+        # Replace invalid negative distances with null
+        # and convert valid centimeters into meters.
         .withColumn(
             "distance_meters_clean",
             F.when(
                 raw_distance < 0,
                 F.lit(None).cast("double"),
-            ).otherwise(F.round(raw_distance / F.lit(100.0), 2)),
+            ).otherwise(
+                F.round(
+                    raw_distance / F.lit(100.0),
+                    2,
+                )
+            ),
         )
+
+        # Mark whether the record contains the minimum
+        # information required to be considered usable.
         .withColumn(
             "is_valid_event",
-            F.col("event_timestamp").isNotNull() & F.col("victim").isNotNull(),
+            F.col("event_timestamp").isNotNull()
+            & F.col("victim").isNotNull(),
         )
-        .withColumn("processed_at", F.current_timestamp())
-        #.withWatermark("event_timestamp", "10 minutes")
-        #.dropDuplicatesWithinWatermark(["event_id"])
+
+        # Record when Spark processed the event.
+        .withColumn(
+            "processed_at",
+            F.current_timestamp(),
+        )
+
+        # Allow Spark to keep deduplication state for late events
+        # arriving within ten minutes of their event time.
+        .withWatermark(
+            "event_timestamp",
+            "10 minutes",
+        )
+
+        # Remove repeated events that have the same event ID
+        # within the watermark-managed streaming state.
+        .dropDuplicatesWithinWatermark(
+            ["event_id"]
+        )
+
+        # Select and order the final output columns.
         .select(
             "event_id",
             "event_type",
@@ -153,12 +242,12 @@ def transform_events(parsed: DataFrame) -> DataFrame:
             "victim",
             "victim_account_id",
             "victim_team_id",
-            F.col("weapon_raw").alias("weapon_raw"),
+            "weapon_raw",
             "weapon_clean",
-            F.col("distance_raw").alias("distance_raw"),
+            "distance_raw",
             "distance_meters_clean",
-            F.col("damage_reason_raw").alias("damage_reason_raw"),
-            F.col("damage_type_raw").alias("damage_type_raw"),
+            "damage_reason_raw",
+            "damage_type_raw",
             "is_headshot",
             "is_suicide",
             "is_environmental_death",
@@ -172,29 +261,57 @@ def transform_events(parsed: DataFrame) -> DataFrame:
     )
 
 
+# Build the complete streaming pipeline:
+# create Spark, read Kafka records, parse JSON,
+# transform events, and continuously print the results.
 def main() -> None:
-    print("1")
     spark = create_spark_session()
+
+    # Reduce unnecessary Spark log output.
     spark.sparkContext.setLogLevel("WARN")
-    print("2")
+
+    # Define the pipeline stages.
     raw_stream = read_raw_combat_stream(spark)
-    print("3")
-    print(raw_stream)
     parsed_stream = parse_events(raw_stream)
-    print("4")
-    print(parsed_stream)
     clean_stream = transform_events(parsed_stream)
-    print("5")
-    print(clean_stream)
-    query = (
+
+    rejected_stream = get_rejected_events(
+        parsed_stream
+    )
+    
+    # Start a streaming query that prints cleaned records
+    # to the terminal every five seconds.
+    clean_query = (
         clean_stream.writeStream
         .format("console")
         .outputMode("append")
         .option("truncate", "false")
         .option("numRows", "100")
-        .option("checkpointLocation", CHECKPOINT_LOCATION)
+        .option(
+            "checkpointLocation",
+            CHECKPOINT_LOCATION,
+        )
         .trigger(processingTime="5 seconds")
-        .queryName("pubg_combat_clean_console")
+        .queryName(
+            "pubg_combat_clean_console"
+        )
+        .start()
+    )
+    
+    rejected_query = (
+        rejected_stream.writeStream
+        .format("console")
+        .outputMode("append")
+        .option("truncate", "false")
+        .option("numRows", "100")
+        .option(
+            "checkpointLocation",
+            "checkpoints/combat-rejected",
+        )
+        .trigger(processingTime="5 seconds")
+        .queryName(
+            "pubg_combat_rejected_console"
+        )
         .start()
     )
 
@@ -202,10 +319,59 @@ def main() -> None:
         f"Spark is reading {KAFKA_COMBAT_TOPIC} "
         f"from {KAFKA_BOOTSTRAP_SERVERS}"
     )
-    print(f"Checkpoint: {CHECKPOINT_LOCATION}")
+    print(
+        f"Checkpoint: {CHECKPOINT_LOCATION}"
+    )
 
-    query.awaitTermination()
+    # Keep the application running while Spark waits
+    # for and processes new Kafka messages.
+    spark.streams.awaitAnyTermination()
 
+
+# Select malformed or incomplete Kafka records and attach
+# a rejection reason so they can be investigated later.
+def get_rejected_events(
+    parsed: DataFrame,
+) -> DataFrame:
+    return (
+        parsed
+        .filter(
+            ~F.col("json_parsed_successfully")
+            | F.col("event_id").isNull()
+            | F.col("match_id").isNull()
+        )
+        .withColumn(
+            "rejection_reason",
+            F.when(
+                ~F.col("json_parsed_successfully"),
+                F.lit("INVALID_JSON_OR_SCHEMA_MISMATCH"),
+            )
+            .when(
+                F.col("event_id").isNull(),
+                F.lit("MISSING_EVENT_ID"),
+            )
+            .when(
+                F.col("match_id").isNull(),
+                F.lit("MISSING_MATCH_ID"),
+            )
+            .otherwise(
+                F.lit("UNKNOWN_VALIDATION_ERROR")
+            ),
+        )
+        .withColumn(
+            "rejected_at",
+            F.current_timestamp(),
+        )
+        .select(
+            "raw_json",
+            "rejection_reason",
+            "rejected_at",
+            "kafka_topic",
+            "kafka_partition",
+            "kafka_offset",
+            "kafka_timestamp",
+        )
+    )
 
 if __name__ == "__main__":
     main()
