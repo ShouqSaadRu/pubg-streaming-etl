@@ -33,5 +33,31 @@ services:
       KAFKA_CLUSTERS_0_NAME: pubg-local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
 
+
+
+  postgres:
+    image: postgres:17
+    container_name: pubg-postgres
+    environment:
+      POSTGRES_DB: pubg
+      POSTGRES_USER: pubg_user
+      POSTGRES_PASSWORD: pubg_password
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: pubg-grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - postgres
+    volumes:
+      - grafana_data:/var/lib/grafana
+
 volumes:
+  postgres_data:
+  grafana_data:
   kafka-data:

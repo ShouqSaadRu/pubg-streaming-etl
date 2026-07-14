@@ -37,6 +37,35 @@ CHECKPOINT_LOCATION = os.getenv(
     "checkpoints/combat-stream",
 )
 
+POSTGRES_URL = os.getenv(
+    "POSTGRES_URL",
+    "jdbc:postgresql://localhost:5432/pubg",
+)
+
+POSTGRES_USER = os.getenv(
+    "POSTGRES_USER",
+    "pubg_user",
+)
+
+POSTGRES_PASSWORD = os.getenv(
+    "POSTGRES_PASSWORD",
+    "pubg_password",
+)
+
+POSTGRES_CLEAN_TABLE = os.getenv(
+    "POSTGRES_CLEAN_TABLE",
+    "combat_events",
+)
+
+POSTGRES_REJECTED_TABLE = os.getenv(
+    "POSTGRES_REJECTED_TABLE",
+    "rejected_combat_events",
+)
+
+REJECTED_CHECKPOINT_LOCATION = os.getenv(
+    "SPARK_REJECTED_CHECKPOINT",
+    "checkpoints/combat-rejected",
+)
 
 # Define the expected structure and data types
 # of the combat-event JSON messages received from Kafka.
@@ -92,7 +121,7 @@ def read_raw_combat_stream(
             KAFKA_BOOTSTRAP_SERVERS,
         )
         .option("subscribe", KAFKA_COMBAT_TOPIC)
-        .option("startingOffsets", "earliest")
+        .option("startingOffsets", "latest")
         .option("failOnDataLoss", "false")
         .load()
     )
@@ -260,6 +289,56 @@ def transform_events(
         )
     )
 
+# Write each cleaned Spark micro-batch to PostgreSQL.
+def write_clean_batch(
+    batch_df: DataFrame,
+    batch_id: int,
+) -> None:
+    if batch_df.isEmpty():
+        return
+
+    (
+        batch_df.write
+        .format("jdbc")
+        .option("url", POSTGRES_URL)
+        .option("dbtable", POSTGRES_CLEAN_TABLE)
+        .option("user", POSTGRES_USER)
+        .option("password", POSTGRES_PASSWORD)
+        .option("driver", "org.postgresql.Driver")
+        .mode("append")
+        .save()
+    )
+
+    print(
+        f"Clean batch {batch_id} written to "
+        f"{POSTGRES_CLEAN_TABLE}"
+    )
+
+
+# Write each rejected Spark micro-batch to PostgreSQL.
+def write_rejected_batch(
+    batch_df: DataFrame,
+    batch_id: int,
+) -> None:
+    if batch_df.isEmpty():
+        return
+
+    (
+        batch_df.write
+        .format("jdbc")
+        .option("url", POSTGRES_URL)
+        .option("dbtable", POSTGRES_REJECTED_TABLE)
+        .option("user", POSTGRES_USER)
+        .option("password", POSTGRES_PASSWORD)
+        .option("driver", "org.postgresql.Driver")
+        .mode("append")
+        .save()
+    )
+
+    print(
+        f"Rejected batch {batch_id} written to "
+        f"{POSTGRES_REJECTED_TABLE}"
+    )
 
 # Build the complete streaming pipeline:
 # create Spark, read Kafka records, parse JSON,
@@ -282,38 +361,30 @@ def main() -> None:
     # Start a streaming query that prints cleaned records
     # to the terminal every five seconds.
     clean_query = (
-        clean_stream.writeStream
-        .format("console")
-        .outputMode("append")
-        .option("truncate", "false")
-        .option("numRows", "100")
-        .option(
-            "checkpointLocation",
-            CHECKPOINT_LOCATION,
-        )
-        .trigger(processingTime="5 seconds")
-        .queryName(
-            "pubg_combat_clean_console"
-        )
-        .start()
+    clean_stream.writeStream
+    .foreachBatch(write_clean_batch)
+    .outputMode("append")
+    .option(
+        "checkpointLocation",
+        CHECKPOINT_LOCATION,
     )
-    
+    .trigger(processingTime="5 seconds")
+    .queryName("pubg_combat_postgres")
+    .start()
+)
+
     rejected_query = (
-        rejected_stream.writeStream
-        .format("console")
-        .outputMode("append")
-        .option("truncate", "false")
-        .option("numRows", "100")
-        .option(
-            "checkpointLocation",
-            "checkpoints/combat-rejected",
-        )
-        .trigger(processingTime="5 seconds")
-        .queryName(
-            "pubg_combat_rejected_console"
-        )
-        .start()
+    rejected_stream.writeStream
+    .foreachBatch(write_rejected_batch)
+    .outputMode("append")
+    .option(
+        "checkpointLocation",
+        REJECTED_CHECKPOINT_LOCATION,
     )
+    .trigger(processingTime="5 seconds")
+    .queryName("pubg_rejected_postgres")
+    .start()
+)
 
     print(
         f"Spark is reading {KAFKA_COMBAT_TOPIC} "
