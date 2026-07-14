@@ -8,3 +8,4 @@ __pycache__/
 .idea/
 checkpoints/combat-stream
 data/eda/
+checkpoints/combat-rejected
