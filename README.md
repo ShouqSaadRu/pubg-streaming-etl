@@ -280,11 +280,11 @@ Current dashboard includes:
 
 ## Live Dashboard
 
-![Live Dashboard](images/Screenshot 2026-07-14 at 11.21.46 PM.png)
+![Initial Grafana dashboard](images/dashboard-before.png)
 
 After Seconds: 
 
-![Live Dashboard](images/Screenshot 2026-07-14 at 11.37.12 PM.png)
+![Updated Grafana dashboard](images/dashboard-after.png)
 
 ---
 
